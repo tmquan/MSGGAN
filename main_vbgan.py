@@ -51,7 +51,6 @@ initial_size = (HEIGHT // s, WIDTH // s)
 
 
 def accumulate(model_accumulator, model, decay=0.993):
-
     params = dict(model.named_parameters())
     ema_params = dict(model_accumulator.named_parameters())
 
@@ -64,10 +63,9 @@ class MSGGAN(LightningModule):
     def __init__(self, hparams):
         super().__init__()
         self.hparams = hparams
-        generator = Generator(z_dimension, initial_size, UPSAMPLE, depth)
+        generator = Generator(self.hparams.latent_dim+self.hparams.types, initial_size, UPSAMPLE, depth)
         discriminator = Discriminator(initial_size, UPSAMPLE, depth)
-        score_predictor = FinalDiscriminatorBlock(
-            discriminator.out_channels, initial_size)
+        score_predictor = FinalDiscriminatorBlock(discriminator.out_channels, initial_size)
         discriminator = nn.Sequential(discriminator, score_predictor)
 
         self.generator = deepcopy(generator)
@@ -117,7 +115,7 @@ class MSGGAN(LightningModule):
         n = torch.randn(batchs, self.hparams.latent_dim).type_as(images)
         n = n / n.norm(p=2, dim=1, keepdim=True)
         p = torch.empty(batchs, self.hparams.types).random_(2).type_as(images)
-        z = torch.cat([n, p*2-1], dim=1)
+        z = torch.cat([n, p * 2 - 1], dim=1)
 
         fake_images = self.generator(z)
         fake_images_detached = [x.detach() for x in fake_images]
@@ -140,7 +138,7 @@ class MSGGAN(LightningModule):
         real_p = self.classifier(real_images[-1])
         bce_real = nn.BCELoss()(real_p, labels)
         Lambda = self.hparams.Lambda
-        c_loss = bce_real + Lambda*bce_fake
+        c_loss = bce_real + Lambda * bce_fake
 
 
         if optimizer_idx == 2:
@@ -155,7 +153,7 @@ class MSGGAN(LightningModule):
         if optimizer_idx == 1:
             # self.discriminator.requires_grad_(True)
             real_scores = self.discriminator(real_images)
-            fake_scores = self.discriminator(fake_images_detached)
+            fake_scores = self.discriminator(fake_images)
             # they have shape [b/2] (because of pacgan)
 
             r = real_scores - fake_scores.mean()
@@ -189,6 +187,26 @@ class MSGGAN(LightningModule):
             f = fake_scores - real_scores.mean()
             generator_loss = torch.abs(1.0 + r).mean() + torch.abs(1.0 - f).mean()
             g_loss = generator_loss
+            # # Calculate w1 and w2
+            e1 = 0 #self.hparams.e1
+            e2 = 9 #self.hparams.e2
+            assert e2 > e1
+            ep = self.current_epoch
+            if ep < e1:
+                w1 = 1
+                w2 = 0
+            elif ep > e2:
+                w1 = 0
+                w2 = 1
+            else:
+                w2 = (ep - e1) / (e2 - e1)
+                w1 = (e2 - ep) / (e2 - e1)
+            ell1_loss = 0
+            for fake_one, one in zip(fake_images, real_images_detached): #torch.mean(torch.abs(fake_imgs - imgs))
+                ell1_loss += torch.nn.L1Loss()(fake_one, one)
+            g_loss *= w2
+            g_loss += w1*ell1_loss
+
             g_loss += bce_fake
             tqdm_dict = {'g_loss': g_loss}
             output = OrderedDict({
@@ -204,23 +222,27 @@ class MSGGAN(LightningModule):
         b1 = self.hparams.b1
         b2 = self.hparams.b2
 
-        opt_g = torch.optim.Adam(
-            self.generator.parameters(), lr=lr, betas=(b1, b2))
-        opt_d = torch.optim.Adam(
-            self.discriminator.parameters(), lr=lr, betas=(b1, b2))
-        opt_c = torch.optim.Adam(
-            self.classifier.parameters(), lr=lr, betas=(b1, b2))
+        opt_g = torch.optim.Adam(self.generator.parameters(), lr=lr, betas=(b1, b2))
+        opt_d = torch.optim.Adam(self.discriminator.parameters(), lr=lr, betas=(b1, b2))
+        opt_c = torch.optim.Adam(self.classifier.parameters(), lr=lr, betas=(b1, b2))
         return [opt_g, opt_d, opt_c], []
+        # sch_g = {'scheduler': torch.optim.lr_scheduler.CosineAnnealingLR(opt_g, T_max=10),
+        #          'interval': 'step'}
+        # sch_d = {'scheduler': torch.optim.lr_scheduler.CosineAnnealingLR(opt_d, T_max=10),
+        #          'interval': 'step'}
+        # sch_c = {'scheduler': torch.optim.lr_scheduler.CosineAnnealingLR(opt_c, T_max=10),
+        #          'interval': 'step'}
+        # return [opt_g, opt_d, opt_c], [sch_g, sch_d, sch_c]
 
     def train_val_dataloader(self):
-        extra = [*zoom_crop(scale=(0.5, 1.3), p=0.5),
+        extra = [*zoom_crop(scale=(0.9, 1.2), p=0.5),
                  *rand_resize_crop(self.hparams.shape, max_scale=1.3),
-                 squish(scale=(0.9, 1.2), p=0.5),
+                 squish(scale=(0.9, 1.1), p=0.5),
                  tilt(direction=(0, 3), magnitude=(-0.3, 0.3), p=0.5),
                  # cutout(n_holes=(1, 5), length=(10, 30), p=0.1)
                  ]
-        transforms = get_transforms(max_rotate=11, max_zoom=1.3, max_lighting=0.1, do_flip=False,
-                                    max_warp=0.15, p_affine=0.5, p_lighting=0.3, xtra_tfms=extra)
+        transforms = get_transforms(max_rotate=10, max_zoom=1.2, max_lighting=0.2, do_flip=False,
+                                    max_warp=0.10, p_affine=.75, p_lighting=.75, xtra_tfms=extra)
         transforms = list(transforms)
         transforms[1] = []
 
@@ -269,14 +291,14 @@ class MSGGAN(LightningModule):
         return ds_train
 
     def eval_dataloader(self):
-        extra = [*zoom_crop(scale=(0.5, 1.3), p=0.5),
+        extra = [*zoom_crop(scale=(0.9, 1.2), p=0.5),
                  *rand_resize_crop(self.hparams.shape, max_scale=1.3),
-                 squish(scale=(0.9, 1.2), p=0.5),
+                 squish(scale=(0.9, 1.1), p=0.5),
                  tilt(direction=(0, 3), magnitude=(-0.3, 0.3), p=0.5),
                  # cutout(n_holes=(1, 5), length=(10, 30), p=0.1)
                  ]
-        transforms = get_transforms(max_rotate=11, max_zoom=1.3, max_lighting=0.1, do_flip=False,
-                                    max_warp=0.15, p_affine=0.5, p_lighting=0.3, xtra_tfms=extra)
+        transforms = get_transforms(max_rotate=10, max_zoom=1.2, max_lighting=0.2, do_flip=False,
+                                    max_warp=0.10, p_affine=.75, p_lighting=.75, xtra_tfms=extra)
         transforms = list(transforms)
         transforms[1] = []
 
@@ -284,8 +306,7 @@ class MSGGAN(LightningModule):
         df['Non_Covid'] = 1 - df['Covid']
         if self.hparams.types == 4:
             dset = (
-                ImageList.from_df(df=df, path=os.path.join(
-                    self.hparams.data, 'data'), cols='Images')
+                ImageList.from_df(df=df, path=os.path.join(self.hparams.data, 'data'), cols='Images')
                 .split_by_rand_pct(1.0, seed=self.hparams.seed)
                 .label_from_df(cols=['Covid', 'Airspace_Opacity', 'Consolidation', 'Pneumonia'], label_cls=MultiCategoryList)
                 .transform(transforms, size=self.hparams.shape, padding_mode='zeros')
@@ -294,8 +315,7 @@ class MSGGAN(LightningModule):
             )
         elif self.hparams.types == 2:
             dset = (
-                ImageList.from_df(df=df, path=os.path.join(
-                    self.hparams.data, 'data'), cols='Images')
+                ImageList.from_df(df=df, path=os.path.join(self.hparams.data, 'data'), cols='Images')
                 .split_by_rand_pct(1.0, seed=self.hparams.seed)
                 .label_from_df(cols=['Covid', 'Non_Covid'], label_cls=MultiCategoryList)
                 .transform(transforms, size=self.hparams.shape, padding_mode='zeros')
@@ -499,10 +519,10 @@ def main(hparams):
 
 if __name__ == '__main__':
     parser = ArgumentParser()
-    parser.add_argument("--lr", type=float, default=0.0002, help="adam: learning rate")
-    parser.add_argument("--b1", type=float, default=0.5, help="adam: decay of first order momentum of gradient")
-    parser.add_argument("--b2", type=float, default=0.999, help="adam: decay of first order momentum of gradient")
-    parser.add_argument("--latent_dim", type=int, default=16, help="dimensionality of the latent space")
+    parser.add_argument("--lr", type=float, default=0.002)
+    parser.add_argument("--b1", type=float, default=0.0)
+    parser.add_argument("--b2", type=float, default=0.99)
+    parser.add_argument("--latent_dim", type=int, default=16)
 
     # hparams = parser.parse_args()
     # parser.add_argument("--latent_dim", type=int, default=16)
@@ -528,7 +548,7 @@ if __name__ == '__main__':
     parser.add_argument('--Lambda', type=float, default=1.0)
     # parser.add_argument("--e1", type=int, default=0)
     # parser.add_argument("--e2", type=int, default=10)
-    parser.add_argument('--epochs', type=int, default=250)
+    parser.add_argument('--epochs', type=int, default=500)
     parser.add_argument('--types', type=int, default=4)
     parser.add_argument('--shape', type=int, default=256)
     parser.add_argument('--batch', type=int, default=32)
